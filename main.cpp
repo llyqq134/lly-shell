@@ -1,16 +1,19 @@
 #include <iostream>
+#include <sstream>
 #include <cstdlib>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <cerrno>
 #include <signal.h>
 
@@ -30,12 +33,25 @@
     GET_ALL_PARTITIONS --done(fdisk)
     UNKNOWN --done
     CRON_TAB --done
-    UMOUNT_CRON
+    unmount_CRON --done
 */
 
 extern char** environ;
 
 static volatile sig_atomic_t sighup_received = 0;
+
+void signal_handler(int sig);
+bool is_executable(const char* path);
+int my_exec(const char* file, char** argv);
+void my_execvp(char** argv);
+void change_directory(std::string path);
+void export_command (char** argv);
+void create_cron_vfs();
+void unmount_cron_vfs();
+void execute_command(char** argv);
+char* expand_variable(const char* token);
+void shell_loop();
+void tokenizer(char* input, char** argv);
 
 void signal_handler(int sig) {
     if (sig == SIGHUP) {
@@ -87,7 +103,7 @@ int my_exec(const char* file, char** argv) {
 
         dir = strtok(NULL, ":");
     }
-
+    
     free(path_copy);
     errno = ENOENT;
     return -1;
@@ -166,12 +182,87 @@ void export_command(char** argv) {
 }
 
 void create_cron_vfs() {
-    char** argv;
+    std::cout << "\nstarting mount\n";
+
+    const char* vfs_dir = "/tmp/vfs";
+    std::filesystem::create_directories(vfs_dir);
+    
+    std::cout << vfs_dir << " was created\n";
+
+    if (system("mountpoint -q /tmp/vfs/ 2>/dev/null") == 0) {
+        std::cout << "/tmp/vfs/ is already mounted - unmounting...\n";
+        system("sudo unmount /tmp/vfs");
+        std::cout << "unmounting was complete\n";
+    }
+
+    std::cout << "mounting tmpfs to " << vfs_dir << "...\n";
+
+    if (system("sudo mount -t tmpfs tmpfs /tmp/vfs") != 0) {
+        std::cerr << "ERROR: failed to mount tmpfs\n";
+        return;
+    }
+
+    std::cout << vfs_dir << " was mounted\n";
+
+    std::string cmd = "crontab -l";
+    FILE* pipe = popen(cmd.c_str(), "r");
+
+    if (!pipe) {
+        std::cerr << "cron: failed to read crontab\n";
+        unmount_cron_vfs();
+        return;
+    }
+
+    char line[1024];
+    int idx = 1;
+
+    while (fgets(line, sizeof(line), pipe)) {
+        line[strcspn(line, "\n")] = 0;
+        if (line[0] == '#' || line[0] == '\0')
+            continue;
+
+        char fname[64];
+        snprintf(fname, sizeof(fname), "%s/job_%03d", vfs_dir, idx);
+        printf("file %s/job_%03d was created\n", vfs_dir, idx++);
+
+        std::ofstream out(fname);
+        if (out.is_open()) {
+            out << line << std::endl;
+            out.close();
+            std::cout << "exported: " << fname << " -> " <<
+                line << std::endl;
+        }
+    }
+
+    pclose(pipe);
+
+    std::cout << "mounting was complete\n\n";
 }
 
-void umount_cron_vfs() {
-    char** argv;
+void unmount_cron_vfs() {
+    const std::filesystem::path path = "/tmp/vfs";
 
+    std::cout << "\nstarting unmount " << path << "...\n";
+    if (system("sudo unmount /tmp/vfs") == 0) {
+        std::cout << path << " was unmounted\n";
+    } else {
+        std::cout << path << " wasnt mounted\n";
+    }
+    try {
+        if (std::filesystem::exists(path)) {
+            std::filesystem::remove_all(path);
+            std::filesystem::remove_all("/tmp/vfs");
+            std::cout << "/tmp/vfs was deleted\n";
+        }
+        else {
+            std::cout << path << " doesnt exist\n";
+        }
+    } catch (const std::filesystem::filesystem_error &e) {
+        std::cerr << "ERROR: error removing " << path << ": " <<
+            e.what() << std::endl;
+    }
+    
+    std::cout << "unmount was complete\n\n";
 }
 
 void execute_command(char** argv) {
@@ -180,8 +271,8 @@ void execute_command(char** argv) {
 
     std::vector<std::string> commands {
          "echo", "pwd", "ls", "cd", "clear", "mkdir", "env", "cat",
-         "export", "fdisk", "sudo", "hexdump", "crontab", "cron",
-         "kill", "ps", "umount_cron", 
+         "export", "fdisk", "sudo", "hexdump", "crontab", "mount_cron",
+         "kill", "ps", "unmount_cron", 
     };
 
     if (strcmp(argv[0], "exit") == 0) {
@@ -201,8 +292,8 @@ void execute_command(char** argv) {
     else if (strcmp(argv[0], "cron") == 0) {
         create_cron_vfs();
     }
-    else if (strcmp(argv[0], "umount_cron") == 0) {
-        umount_cron_vfs();
+    else if (strcmp(argv[0], "unmount_cron") == 0) {
+        unmount_cron_vfs();
     }
     else if (std::find(
                 begin(commands),
